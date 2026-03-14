@@ -1,0 +1,10 @@
+[project]
+name = "dagster-components"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dagster>=1.12.19",
+    "sqlalchemy>=2.0.48",
+]
