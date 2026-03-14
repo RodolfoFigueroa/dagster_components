@@ -1,6 +1,8 @@
 import dagster as dg
 import sqlalchemy
 from pydantic import PrivateAttr
+from typing import Generator
+from contextlib import contextmanager
 
 
 class PostGISResource(dg.ConfigurableResource):
@@ -17,5 +19,12 @@ class PostGISResource(dg.ConfigurableResource):
             f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}",
         )
 
-    def get_connection(self) -> sqlalchemy.engine.Connection:
-        return self._engine.connect()
+    @contextmanager
+    def connect(self) -> Generator[sqlalchemy.engine.Connection, None, None]:
+        conn = None
+        try:
+            conn = self._engine.connect()
+            yield conn
+        finally:
+            if conn is not None:
+                conn.close()
