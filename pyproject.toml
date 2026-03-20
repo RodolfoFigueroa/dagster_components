@@ -8,3 +8,8 @@ dependencies = [
     "dagster>=1.12.19",
     "sqlalchemy>=2.0.48",
 ]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.38.3",
+]
