@@ -10,13 +10,6 @@ class PostGISResource(dg.ConfigurableResource):
     This resource provides a configured connection to a PostGIS-enabled PostgreSQL database.
     It manages SQLAlchemy engine creation and connection lifecycle.
 
-    Args:
-        host (str): The hostname or IP address of the PostgreSQL server.
-        port (str): The port number on which PostgreSQL is listening.
-        user (str): The username for database authentication.
-        password (str): The password for database authentication.
-        db (str): The name of the database to connect to.
-
     Attributes:
         host (str): The hostname or IP address of the PostgreSQL server.
         port (str): The port number on which PostgreSQL is listening.
@@ -24,6 +17,7 @@ class PostGISResource(dg.ConfigurableResource):
         password (str): The password for database authentication.
         db (str): The name of the database to connect to.
     """
+
     host: str
     port: str
     user: str
