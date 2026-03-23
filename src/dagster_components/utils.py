@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Sequence, Literal
 from dagster_components.types import G
 import pandas as pd
 
@@ -6,6 +6,8 @@ import pandas as pd
 def cast_all_columns_to_numeric(
     df: G,
     ignore: Sequence[str] | None = None,
+    *,
+    errors: Literal["coerce", "raise"] = "raise",
 ) -> G:
     """Casts all columns in a DataFrame to numeric, optionally skipping some.
 
@@ -27,5 +29,5 @@ def cast_all_columns_to_numeric(
     df = df.copy()
     for col in df.columns:
         if col not in ignore:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors=errors)
     return df
