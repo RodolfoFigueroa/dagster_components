@@ -22,6 +22,11 @@ class _DataFrameBasePostgresManager(
 
     _engine: sqlalchemy.engine.Engine = PrivateAttr()
 
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:  # noqa: ARG002
+        self._engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?client_encoding=utf8",
+        )
+
     def write_table(
         self,
         df: DFType,
@@ -39,11 +44,6 @@ class _DataFrameBasePostgresManager(
     ) -> DFType:
         msg = "load_table must be implemented by subclasses"
         raise NotImplementedError(msg)
-
-    def setup_for_execution(self, context: dg.InitResourceContext) -> None:  # noqa: ARG002
-        self._engine = sqlalchemy.create_engine(
-            f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?client_encoding=utf8",
-        )
 
     def handle_output(
         self,
@@ -67,6 +67,28 @@ class _DataFrameBasePostgresManager(
                         f'ALTER TABLE {table} ADD PRIMARY KEY ("{primary_key}");',
                     ),
                 )
+
+            if "foreign_keys" in context.definition_metadata:
+                foreign_keys = context.definition_metadata["foreign_keys"]
+
+                for fk_map in foreign_keys:
+                    fk_col = fk_map["column"]
+                    ref_table = fk_map["ref_table"]
+                    ref_col = fk_map["ref_column"]
+
+                    if fk_col not in obj.columns:
+                        err = f"Foreign key column {fk_col} not found in DataFrame columns."
+                        raise ValueError(err)
+
+                    conn.execute(
+                        sqlalchemy.text(
+                            f"""
+                            ALTER TABLE {table}
+                            ADD FOREIGN KEY ("{fk_col}")
+                            REFERENCES {ref_table}("{ref_col}")
+                            """,
+                        ),
+                    )
 
             conn.commit()
 
