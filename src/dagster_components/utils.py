@@ -75,6 +75,3 @@ def cast_all_columns_to_numeric(
             df[col] = new_col
 
     return df
-
-
-cast_all_columns_to_numeric
