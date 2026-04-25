@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "dagster>=1",
+    "earthengine-api>=1",
     "geopandas>=1",
     "pandas>=2",
     "sqlalchemy>=2",

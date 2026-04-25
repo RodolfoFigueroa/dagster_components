@@ -1,281 +1,17 @@
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Generic, Literal, overload
+from typing import Literal, overload
 
 import dagster as dg
 import geopandas as gpd
 import pandas as pd
-import sqlalchemy
-from dagster._config.pythonic_config.resource import TResValue
 
-from dagster_components.resources import PostgresResource
 from dagster_components.types import DFType, T
 
 
-class _DataFrameBasePostgresManager(
-    dg.ConfigurableIOManager,
-    Generic[DFType, TResValue],
-):
-    """Base class for Dagster IO managers that read and write DataFrames to/from PostgreSQL.
-
-    Subclasses must implement ``write_table`` and ``load_table`` to define how data is
-    serialized and deserialized for a specific DataFrame type.
-
-    Args:
-        postgres_resource: A Dagster resource dependency providing a PostgreSQL connection.
-
-    Attributes:
-        postgres_resource: A Dagster resource dependency providing a PostgreSQL connection.
-    """
-
-    postgres_resource: dg.ResourceDependency[PostgresResource]
-
-    def write_table(
-        self,
-        df: DFType,
-        table_name: str,
-        conn: sqlalchemy.Connection,
-    ) -> None:
-        """Write a DataFrame to a PostgreSQL table.
-
-        Must be implemented by subclasses.
-
-        Args:
-            df: The DataFrame to write.
-            table_name: The name of the destination table.
-            conn: An active SQLAlchemy database connection.
-
-        Raises:
-            NotImplementedError: Always, since this is an abstract method.
-        """
-        msg = "write_table must be implemented by subclasses"
-        raise NotImplementedError(msg)
-
-    def load_table(
-        self,
-        table_name: str,
-        cols_str: str,
-        conn: sqlalchemy.Connection,
-    ) -> DFType:
-        """Load data from a PostgreSQL table into a DataFrame.
-
-        Must be implemented by subclasses.
-
-        Args:
-            table_name: The name of the source table.
-            cols_str: A comma-separated string of column names to select, or ``"*"`` for all columns.
-            conn: An active SQLAlchemy database connection.
-
-        Returns:
-            The loaded DataFrame.
-
-        Raises:
-            NotImplementedError: Always, since this is an abstract method.
-        """
-        msg = "load_table must be implemented by subclasses"
-        raise NotImplementedError(msg)
-
-    def handle_output(
-        self,
-        context: dg.OutputContext,
-        obj: DFType,
-    ) -> None:
-        """Persist a DataFrame as a PostgreSQL table.
-
-        Writes the DataFrame to the table specified in
-        ``context.definition_metadata["table_name"]``. Optionally adds a primary key
-        constraint and foreign key constraints based on additional metadata keys.
-
-        Args:
-            context: The Dagster output context. Relevant metadata keys:
-                - ``table_name`` (str, required): Target table name.
-                - ``primary_key`` (str, optional): Column to set as the primary key.
-                - ``foreign_keys`` (list[dict], optional): List of foreign key mappings,
-                  each with keys ``column``, ``ref_table``, and ``ref_column``.
-            obj: The DataFrame to write.
-
-        Raises:
-            ValueError: If the specified primary key or a foreign key column is not
-                present in the DataFrame's columns.
-        """
-        table = context.definition_metadata["table_name"]
-
-        with self.postgres_resource.connect() as conn:
-            self.write_table(obj, table, conn)
-
-            if "primary_key" in context.definition_metadata:
-                primary_key = context.definition_metadata["primary_key"]
-
-                if primary_key not in obj.columns:
-                    err = f"Primary key {primary_key} not found in DataFrame columns"
-                    raise ValueError(err)
-
-                conn.execute(
-                    sqlalchemy.text(
-                        f'ALTER TABLE {table} ADD PRIMARY KEY ("{primary_key}");',
-                    ),
-                )
-
-            if "foreign_keys" in context.definition_metadata:
-                foreign_keys = context.definition_metadata["foreign_keys"]
-
-                for fk_map in foreign_keys:
-                    fk_col = fk_map["column"]
-                    ref_table = fk_map["ref_table"]
-                    ref_col = fk_map["ref_column"]
-
-                    if fk_col not in obj.columns:
-                        err = f"Foreign key column {fk_col} not found in DataFrame columns."
-                        raise ValueError(err)
-
-                    conn.execute(
-                        sqlalchemy.text(
-                            f"""
-                            ALTER TABLE {table}
-                            ADD FOREIGN KEY ("{fk_col}")
-                            REFERENCES {ref_table}("{ref_col}")
-                            """,
-                        ),
-                    )
-
-            conn.commit()
-
-    def load_input(self, context: dg.InputContext) -> DFType:
-        """Load a DataFrame from the PostgreSQL table written by the upstream output.
-
-        Reads from the table specified in the upstream output's ``table_name`` metadata.
-        If the input metadata contains a ``columns`` key, only those columns are selected.
-
-        Args:
-            context: The Dagster input context. Relevant metadata keys:
-                - ``columns`` (list[str], optional): Specific columns to load. Defaults to all columns.
-
-        Returns:
-            The loaded DataFrame.
-
-        Raises:
-            ValueError: If no upstream output is found.
-        """
-        upstream_output = context.upstream_output
-        if upstream_output is None:
-            err = "No upstream output found."
-            raise ValueError(err)
-
-        table = upstream_output.definition_metadata["table_name"]
-
-        in_metadata = context.definition_metadata
-        if "columns" in in_metadata:
-            wanted_cols = in_metadata["columns"]
-            cols_str = ", ".join(wanted_cols)
-        else:
-            cols_str = "*"
-
-        with self.postgres_resource.connect() as conn:
-            return self.load_table(table, cols_str, conn)
-
-
-class DataFramePostgresManager(_DataFrameBasePostgresManager[pd.DataFrame, Any]):
-    """Dagster IO manager for reading and writing pandas DataFrames to/from PostgreSQL.
-
-    Uses pandas ``to_sql`` and ``read_sql`` for serialization and deserialization.
-    Inherits output and input handling (including primary and foreign key constraints)
-    from ``_DataFrameBasePostgresManager``.
-
-    Args:
-        postgres_resource: A Dagster resource dependency providing a PostgreSQL connection.
-    """
-
-    def write_table(
-        self,
-        df: pd.DataFrame,
-        table_name: str,
-        conn: sqlalchemy.Connection,
-    ) -> None:
-        """Write a pandas DataFrame to a PostgreSQL table using ``to_sql``.
-
-        Replaces the table if it already exists.
-
-        Args:
-            df: The pandas DataFrame to write.
-            table_name: The name of the destination table.
-            conn: An active SQLAlchemy database connection.
-        """
-        df.to_sql(table_name, conn, if_exists="replace", index=False)
-
-    def load_table(
-        self,
-        table_name: str,
-        cols_str: str,
-        conn: sqlalchemy.Connection,
-    ) -> pd.DataFrame:
-        """Load a pandas DataFrame from a PostgreSQL table using ``read_sql``.
-
-        Args:
-            table_name: The name of the source table.
-            cols_str: A comma-separated string of column names to select, or ``"*"`` for all columns.
-            conn: An active SQLAlchemy database connection.
-
-        Returns:
-            The loaded DataFrame.
-        """
-        return pd.read_sql(f"SELECT {cols_str} FROM {table_name}", conn)  # noqa: S608
-
-
-class GeoDataFramePostGISManager(_DataFrameBasePostgresManager[gpd.GeoDataFrame, Any]):
-    """Dagster IO manager for reading and writing GeoDataFrames to/from PostGIS.
-
-    Uses geopandas ``to_postgis`` and ``read_postgis`` for serialization and
-    deserialization. Assumes a ``geometry`` column is present for spatial data.
-    Inherits output and input handling from ``_DataFrameBasePostgresManager``.
-
-    Args:
-        postgres_resource: A Dagster resource dependency providing a PostgreSQL connection.
-    """
-
-    def write_table(
-        self,
-        df: gpd.GeoDataFrame,
-        table_name: str,
-        conn: sqlalchemy.Connection,
-    ) -> None:
-        """Write a GeoDataFrame to a PostGIS table using ``to_postgis``.
-
-        Replaces the table if it already exists.
-
-        Args:
-            df: The GeoDataFrame to write.
-            table_name: The name of the destination table.
-            conn: An active SQLAlchemy database connection.
-        """
-        df.to_postgis(table_name, conn, if_exists="replace")
-
-    def load_table(
-        self,
-        table_name: str,
-        cols_str: str,
-        conn: sqlalchemy.Connection,
-    ) -> gpd.GeoDataFrame:
-        """Load a GeoDataFrame from a PostGIS table using ``read_postgis``.
-
-        Assumes the geometry column is named ``geometry``.
-
-        Args:
-            table_name: The name of the source table.
-            cols_str: A comma-separated string of column names to select, or ``"*"`` for all columns.
-            conn: An active SQLAlchemy database connection.
-
-        Returns:
-            The loaded GeoDataFrame.
-        """
-        return gpd.read_postgis(
-            f"SELECT {cols_str} FROM {table_name}",  # noqa: S608
-            conn,
-            geom_col="geometry",
-        )
-
-
 class PathResource(dg.ConfigurableResource):
-    """Dagster resource providing a base output directory path for file-based IO managers.
+    """Dagster resource providing a base output directory path for file-based IO
+    managers.
 
     Args:
         out_path: The root directory path where assets are stored.
@@ -287,25 +23,23 @@ class PathResource(dg.ConfigurableResource):
     out_path: str
 
 
-class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
-    """Base class for Dagster IO managers that read and write DataFrames to/from files.
+class _BaseFileManager(dg.ConfigurableIOManager):
+    """Base class for Dagster IO managers that read/write to/from files.
 
     Handles path resolution for both partitioned and non-partitioned assets.
     Subclasses must implement ``handle_output`` and ``load_input``.
 
     Args:
         path_resource: A resource dependency providing the root output directory path.
-        extension: The file extension to use. One of ``.parquet``, ``.csv``, ``.gpkg``,
-            or ``.geoparquet``.
+        extension: The file extension to use.
 
     Attributes:
         path_resource: A resource dependency providing the root output directory path.
-        extension: The file extension to use. One of ``.parquet``, ``.csv``, ``.gpkg``,
-            or ``.geoparquet``.
+        extension: The file extension to use.
     """
 
     path_resource: dg.ResourceDependency[PathResource]
-    extension: Literal[".parquet", ".csv", ".gpkg", ".geoparquet"]
+    extension: str
 
     def _get_single_partition_key_path(
         self, partition_key: str, asset_dir: Path
@@ -365,7 +99,8 @@ class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
         ``True``, returns a mapping of partition key to ``Path``.
 
         Args:
-            context: The Dagster input or output context providing partition key information.
+            context: The Dagster input or output context providing partition key
+                information.
             asset_dir: The root directory for the asset.
             allow_multiple_partitions: Whether multiple partition paths may be returned.
 
@@ -384,7 +119,8 @@ class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
 
         if not allow_multiple_partitions:
             err = (
-                "Multiple partition keys found for asset, but allow_multiple_partitions is False. "
+                "Multiple partition keys found for asset, but allow_multiple_partitions"
+                "is False."
                 f"Partition keys: {context.asset_partition_keys}"
             )
             raise ValueError(err)
@@ -485,7 +221,7 @@ class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
         raise TypeError(err)
 
     def handle_output(self, context: dg.OutputContext, obj: DFType) -> None:
-        """Write a DataFrame to a file. Must be implemented by subclasses.
+        """Write an object to a file. Must be implemented by subclasses.
 
         Raises:
             NotImplementedError: Always, since this is an abstract method.
@@ -493,7 +229,7 @@ class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
         raise NotImplementedError
 
     def load_input(self, context: dg.InputContext) -> DFType:
-        """Load a DataFrame from a file. Must be implemented by subclasses.
+        """Load an object from a file. Must be implemented by subclasses.
 
         Raises:
             NotImplementedError: Always, since this is an abstract method.
@@ -501,7 +237,7 @@ class _DataFrameBaseFileManager(dg.ConfigurableIOManager):
         raise NotImplementedError
 
 
-class DataFrameFileManager(_DataFrameBaseFileManager):
+class DataFrameFileManager(_BaseFileManager):
     """Dagster IO manager for reading and writing pandas DataFrames to/from local files.
 
     Supports ``.parquet`` and ``.csv`` file formats. For partitioned assets, loading
@@ -566,7 +302,7 @@ class DataFrameFileManager(_DataFrameBaseFileManager):
         raise ValueError(err)
 
 
-class GeoDataFrameFileManager(_DataFrameBaseFileManager):
+class GeoDataFrameFileManager(_BaseFileManager):
     """Dagster IO manager for reading and writing GeoDataFrames to/from local files.
 
     Supports ``.gpkg`` (GeoPackage) and ``.geoparquet`` file formats. For partitioned
@@ -606,7 +342,8 @@ class GeoDataFrameFileManager(_DataFrameBaseFileManager):
         """Load a GeoDataFrame (or a mapping of GeoDataFrames) from a file.
 
         For non-partitioned or single-partition assets, returns a single GeoDataFrame.
-        For multi-partition inputs, returns a dict mapping partition key to GeoDataFrame.
+        For multi-partition inputs, returns a dict mapping partition key to
+        GeoDataFrame.
 
         Args:
             context: The Dagster input context used to resolve the file path(s).
