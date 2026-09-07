@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-09-07)
+
+### Features
+
+- Simplify Postgres API
+  ([`e3006bf`](https://github.com/RodolfoFigueroa/cfc-dagster-utils/commit/e3006bf2ec8d8e74eca509503a2afa25e57b6ca7))
+
+
 ## v1.3.5 (2026-08-20)
 
 ### Bug Fixes
