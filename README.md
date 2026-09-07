@@ -56,17 +56,19 @@ Each combination runs in a temporary isolated environment, so packages installed
 the project's `.venv` cannot hide a missing optional dependency. GitHub Actions calls
 the same runner, keeping the local and CI matrices in sync.
 
-## PostgreSQL and PostGIS assets
+## PostgreSQL and PostGIS outputs
 
 Install the `postgres` extra to use psycopg 3, GeoAlchemy2, the PostgreSQL resource,
-and the unified pandas/GeoPandas IO manager:
+and the pandas/GeoPandas IO manager:
 
 ```shell
 pip install 'cfc_dagster_utils[postgres]'
 ```
 
-Each database-backed asset declares a serializable table contract. The write mode is
-configured per asset; `create` is the safe default.
+The IO manager is a write-only bridge for placing Python-created frames in PostgreSQL.
+Each output declares its destination with flat `schema` and `table` metadata. Any
+schema is supported and is created when it does not already exist. Existing tables are
+replaced.
 
 ```python
 import geopandas as gpd
@@ -74,25 +76,13 @@ import geopandas as gpd
 import dagster as dg
 from cfc_dagster_utils.managers.postgres import PostgresIOManager
 from cfc_dagster_utils.resources import PostgresResource
-from cfc_dagster_utils.types import (
-    PostgresRelation,
-    PostgresTableSpec,
-    PostgresWriteMode,
-)
-
-CITIES = PostgresTableSpec(
-    relation=PostgresRelation(schema="public", name="cities"),
-    write_mode=PostgresWriteMode.REPLACE,
-    primary_key=("city_id",),
-    geometry_column="geometry",
-)
 
 
 @dg.asset(
     io_manager_key="postgres_io_manager",
-    metadata=CITIES.to_dagster_metadata(),
+    metadata={"schema": "staging", "table": "cities_prepared"},
 )
-def cities() -> gpd.GeoDataFrame:
+def cities_prepared() -> gpd.GeoDataFrame:
     return load_cities()
 
 
@@ -105,7 +95,7 @@ postgres_resource = PostgresResource(
 )
 
 defs = dg.Definitions(
-    assets=[cities],
+    assets=[cities_prepared],
     resources={
         "postgres_resource": postgres_resource,
         "postgres_io_manager": PostgresIOManager(
@@ -115,21 +105,10 @@ defs = dg.Definitions(
 )
 ```
 
-Declaring `geometry_column` makes the relation spatial. The IO manager maintains a
-single-column GiST index for it automatically; `indexes` is reserved for additional
-indexes and must not repeat the managed geometry index.
+GeoDataFrames use their active geometry column and CRS when written through
+`GeoDataFrame.to_postgis()`. The manager does not create constraints or explicitly
+manage indexes. Use a database transformation framework such as dbt for durable models,
+contracts, constraints, indexes, and SQL transformations.
 
-Downstream assets can request `PostgresRelation` to receive a zero-copy table handle
-instead of loading the table into memory:
-
-```python
-@dg.asset
-def city_summary(cities: PostgresRelation) -> None:
-    # cities is PostgresRelation(schema="public", name="cities")
-    run_server_side_query(cities)
-```
-
-For an asset that performs its own server-side SQL, use
-`PostgresResource.stage_dataframe()` and `publish_relation()` in the same transaction,
-then return the published relation. `PostgresIOManager` verifies that the declared
-relation exists without uploading it again.
+`PostgresIOManager` does not load tables into downstream Python assets. Use
+`PostgresResource.connect()` for an explicit database read when one is needed.

@@ -1,6 +1,5 @@
-from collections.abc import Mapping, Sequence
-from dataclasses import replace
-from typing import Any, Protocol
+from collections.abc import Mapping
+from typing import Any
 
 import geopandas as gpd
 import pandas as pd
@@ -8,7 +7,6 @@ import sqlalchemy
 
 from cfc_dagster_utils._optional import raise_optional_dependency_error
 from cfc_dagster_utils.resources import PostgresResource
-from cfc_dagster_utils.types import PostgresRelation, PostgresTableSpec
 
 try:
     import dagster as dg
@@ -20,202 +18,88 @@ except ModuleNotFoundError as error:
         extra="postgres",
     )
 
-
-class _FrameHandler(Protocol):
-    def load(
-        self,
-        conn: sqlalchemy.Connection,
-        relation: PostgresRelation,
-        columns: tuple[str, ...] | None,
-        spec: PostgresTableSpec,
-    ) -> pd.DataFrame: ...
-
-
-def _qualified_name(
-    conn: sqlalchemy.Connection,
-    relation: PostgresRelation,
-) -> str:
-    preparer = conn.dialect.identifier_preparer
-    return f"{preparer.quote_schema(relation.schema)}.{preparer.quote(relation.name)}"
-
-
-def _select_sql(
-    conn: sqlalchemy.Connection,
-    relation: PostgresRelation,
-    columns: tuple[str, ...] | None,
-) -> sqlalchemy.TextClause:
-    if columns is None:
-        selected = "*"
-    else:
-        preparer = conn.dialect.identifier_preparer
-        selected = ", ".join(preparer.quote(column) for column in columns)
-    return sqlalchemy.text(
-        f"SELECT {selected} FROM {_qualified_name(conn, relation)}"  # noqa: S608 - identifiers are dialect-quoted.
+try:
+    import geoalchemy2  # noqa: F401
+except ModuleNotFoundError as error:
+    raise_optional_dependency_error(
+        error,
+        import_name="geoalchemy2",
+        dependency_name="geoalchemy2",
+        extra="postgres",
     )
 
 
-class _PandasHandler:
-    def load(
-        self,
-        conn: sqlalchemy.Connection,
-        relation: PostgresRelation,
-        columns: tuple[str, ...] | None,
-        spec: PostgresTableSpec,  # noqa: ARG002
-    ) -> pd.DataFrame:
-        return pd.read_sql(_select_sql(conn, relation, columns), conn)
-
-
-class _GeoPandasHandler:
-    def load(
-        self,
-        conn: sqlalchemy.Connection,
-        relation: PostgresRelation,
-        columns: tuple[str, ...] | None,
-        spec: PostgresTableSpec,
-    ) -> gpd.GeoDataFrame:
-        geometry_column = spec.geometry_column or "geometry"
-        if columns is not None and geometry_column not in columns:
-            msg = (
-                f"GeoDataFrame input columns must include geometry column "
-                f"{geometry_column!r}"
-            )
-            raise ValueError(msg)
-        return gpd.read_postgis(
-            _select_sql(conn, relation, columns),
-            conn,
-            geom_col=geometry_column,
-        )
-
-
 class PostgresIOManager(dg.ConfigurableIOManager):
-    """Persist pandas, GeoPandas, or server-native PostgreSQL relation assets."""
+    """Write pandas and GeoPandas outputs to PostgreSQL tables."""
 
     postgres_resource: dg.ResourceDependency[PostgresResource]
 
     @staticmethod
-    def _spec(metadata: Mapping[str, Any]) -> PostgresTableSpec:
-        return PostgresTableSpec.from_dagster_metadata(metadata)
+    def _destination(metadata: Mapping[str, Any]) -> tuple[str, str]:
+        schema = metadata.get("schema")
+        table = metadata.get("table")
+        if not isinstance(schema, str) or not schema.strip():
+            msg = "PostgreSQL outputs require non-empty string metadata 'schema'"
+            raise ValueError(msg)
+        if not isinstance(table, str) or not table.strip():
+            msg = "PostgreSQL outputs require non-empty string metadata 'table'"
+            raise ValueError(msg)
+        return schema, table
 
     @staticmethod
-    def _columns(metadata: Mapping[str, Any]) -> tuple[str, ...] | None:
-        value = metadata.get("columns")
-        if value is None:
-            return None
-        if (
-            not isinstance(value, Sequence)
-            or isinstance(value, str)
-            or not all(isinstance(column, str) and column for column in value)
-        ):
-            msg = "Input metadata 'columns' must be a sequence of non-empty strings"
-            raise ValueError(msg)
-        return tuple(value)
+    def _ensure_schema(conn: sqlalchemy.Connection, schema: str) -> None:
+        quoted_schema = conn.dialect.identifier_preparer.quote_schema(schema)
+        conn.execute(sqlalchemy.text(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}"))
 
     def handle_output(
         self,
         context: dg.OutputContext,
-        obj: pd.DataFrame | PostgresRelation,
+        obj: pd.DataFrame,
     ) -> None:
-        """Persist a frame or validate an already-published relation."""
-        spec = self._spec(context.definition_metadata)
-        if isinstance(obj, PostgresRelation):
-            self._handle_relation_output(spec, obj)
-            context.add_output_metadata(self._output_metadata(spec, None))
-            return
-
+        """Replace the configured PostgreSQL table with a frame."""
         if not isinstance(obj, pd.DataFrame):
             msg = f"Unsupported PostgreSQL output type: {type(obj).__name__}"
             raise TypeError(msg)
 
+        schema, table = self._destination(context.definition_metadata)
+        geometry_column: str | None = None
         if isinstance(obj, gpd.GeoDataFrame):
-            geometry_column = spec.geometry_column or "geometry"
-            if obj.geometry.name != geometry_column:
-                msg = (
-                    f"GeoDataFrame geometry column {obj.geometry.name!r} does not "
-                    f"match table specification {geometry_column!r}"
-                )
-                raise ValueError(msg)
-            spec = replace(spec, geometry_column=geometry_column)
+            geometry_name = obj.geometry.name
+            if not isinstance(geometry_name, str):
+                msg = "GeoDataFrame geometry column names must be strings"
+                raise TypeError(msg)
+            geometry_column = geometry_name
 
-        with (
-            self.postgres_resource.begin() as conn,
-            self.postgres_resource.stage_dataframe(
-                conn,
-                obj,
-                spec.relation,
-            ) as stage,
-        ):
-            self.postgres_resource.publish_relation(conn, stage, spec)
-
-        context.add_output_metadata(self._output_metadata(spec, len(obj)))
-
-    def _handle_relation_output(
-        self,
-        spec: PostgresTableSpec,
-        relation: PostgresRelation,
-    ) -> None:
-        if relation != spec.relation:
-            msg = (
-                f"Returned relation {relation.display_name} does not match declared "
-                f"relation {spec.relation.display_name}"
-            )
-            raise ValueError(msg)
         with self.postgres_resource.begin() as conn:
-            if not self.postgres_resource.relation_exists(conn, relation):
-                msg = f"Published relation {relation.display_name} does not exist"
-                raise ValueError(msg)
-            self.postgres_resource.ensure_geometry_index(conn, spec)
+            self._ensure_schema(conn, schema)
+            if isinstance(obj, gpd.GeoDataFrame):
+                obj.to_postgis(
+                    table,
+                    conn,
+                    schema=schema,
+                    if_exists="replace",
+                    index=False,
+                )
+            else:
+                obj.to_sql(
+                    table,
+                    conn,
+                    schema=schema,
+                    if_exists="replace",
+                    index=False,
+                )
 
-    def load_input(
-        self,
-        context: dg.InputContext,
-    ) -> pd.DataFrame | PostgresRelation:
-        """Return a zero-copy relation or load the requested frame type."""
-        upstream_output = context.upstream_output
-        if upstream_output is None:
-            msg = "PostgreSQL inputs require an upstream output"
-            raise ValueError(msg)
-
-        spec = self._spec(upstream_output.definition_metadata)
-        requested_type = context.dagster_type.typing_type
-        if requested_type is PostgresRelation:
-            return spec.relation
-
-        handler = self._handler_for_type(requested_type)
-        columns = self._columns(context.definition_metadata)
-        with self.postgres_resource.connect() as conn:
-            return handler.load(conn, spec.relation, columns, spec)
-
-    @staticmethod
-    def _handler_for_type(requested_type: object) -> _FrameHandler:
-        if isinstance(requested_type, type) and issubclass(
-            requested_type,
-            gpd.GeoDataFrame,
-        ):
-            return _GeoPandasHandler()
-        if isinstance(requested_type, type) and issubclass(
-            requested_type,
-            pd.DataFrame,
-        ):
-            return _PandasHandler()
-        msg = (
-            "PostgresIOManager inputs must be annotated as PostgresRelation, "
-            "pandas.DataFrame, or geopandas.GeoDataFrame"
-        )
-        raise TypeError(msg)
-
-    @staticmethod
-    def _output_metadata(
-        spec: PostgresTableSpec,
-        row_count: int | None,
-    ) -> dict[str, str | int]:
         metadata: dict[str, str | int] = {
-            "schema": spec.relation.schema,
-            "table": spec.relation.name,
-            "relation": spec.relation.display_name,
-            "write_mode": spec.write_mode.value,
+            "schema": schema,
+            "table": table,
+            "relation": f"{schema}.{table}",
+            "row_count": len(obj),
         }
-        if row_count is not None:
-            metadata["row_count"] = row_count
-        if spec.geometry_column is not None:
-            metadata["geometry_column"] = spec.geometry_column
-        return metadata
+        if geometry_column is not None:
+            metadata["geometry_column"] = geometry_column
+        context.add_output_metadata(metadata)
+
+    def load_input(self, context: dg.InputContext) -> None:
+        """Reject input loading because this manager is output-only."""
+        msg = "PostgresIOManager is output-only and cannot load inputs"
+        raise NotImplementedError(msg)

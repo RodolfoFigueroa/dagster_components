@@ -24,6 +24,7 @@ OPTIONAL_MODULES = {
     "cfc_dagster_utils.managers.json": "dagster",
     "cfc_dagster_utils.managers.postgres": "postgres",
     "cfc_dagster_utils.components.dvc": "dvc",
+    "cfc_dagster_utils.components.postgres": "postgres",
     "cfc_dagster_utils.managers.earthengine": "earthengine",
     "cfc_dagster_utils.managers.xarray": "xarray",
 }
